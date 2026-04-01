@@ -14,6 +14,7 @@ class CWEService:
     """Service for fetching and managing CWE data from MITRE"""
     
     def __init__(self):
+        # Fix path: go up one level from services directory to reach data folder
         self.cache_file = Path(__file__).parent.parent / "data" / "cwe_complete.json"
         logger.info(f"Looking for CWE data at: {self.cache_file}")
         
@@ -21,12 +22,19 @@ class CWEService:
         """Fetch all CWE weaknesses from the complete MITRE database"""
         try:
             if self.cache_file.exists():
-                with open(self.cache_file, 'r') as f:
+                with open(self.cache_file, 'r', encoding='utf-8') as f:
                     cwes = json.load(f)
                     logger.info(f"✅ Loaded {len(cwes)} CWEs from MITRE database")
                     return cwes
             else:
                 logger.warning(f"CWE database file not found at {self.cache_file}")
+                # Try alternative path
+                alt_path = Path(__file__).parent / "data" / "cwe_complete.json"
+                if alt_path.exists():
+                    with open(alt_path, 'r', encoding='utf-8') as f:
+                        cwes = json.load(f)
+                        logger.info(f"✅ Loaded {len(cwes)} CWEs from alternative path: {alt_path}")
+                        return cwes
                 return self._get_basic_cwes()
                 
         except Exception as e:
@@ -67,6 +75,7 @@ class CWEService:
     
     def _get_basic_cwes(self) -> List[Dict]:
         """Return basic CWE list as fallback"""
+        logger.warning("Using fallback basic CWE list")
         return [
             {"id": "CWE-89", "name": "SQL Injection", "severity": "critical", "description": "Improper Neutralization of Special Elements used in an SQL Command"},
             {"id": "CWE-79", "name": "Cross-site Scripting (XSS)", "severity": "high", "description": "Improper Neutralization of Input During Web Page Generation"},
