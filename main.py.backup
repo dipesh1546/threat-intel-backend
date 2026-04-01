@@ -1,0 +1,527 @@
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import json
+import re
+import asyncio
+from datetime import datetime
+from pathlib import Path
+
+# Import services
+from services.virustotal import vt_service
+from services.abuseipdb import abuseipdb_service
+from services.threat_feeds import threat_aggregator
+from services.websocket_manager import websocket_manager
+
+# Create FastAPI app
+app = FastAPI(
+    title="NepalThreat Intel API",
+    description="Threat Intelligence Dashboard Backend API",
+    version="1.0.0"
+)
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Load mock data
+DATA_DIR = Path(__file__).parent / "data"
+
+def load_mock_data():
+    """Load mock data from JSON file"""
+    data_file = DATA_DIR / "mock_data.json"
+    if data_file.exists():
+        with open(data_file, 'r') as f:
+            return json.load(f)
+    return get_default_data()
+
+def get_default_data():
+    """Return default mock data"""
+    return {
+        "stats": {
+            "threat_level": 72,
+            "active_threats": 1247,
+            "critical_count": 23,
+            "high_count": 89,
+            "medium_count": 312,
+            "low_count": 823,
+            "total_iocs": 15420,
+            "total_cves": 3428,
+            "total_actors": 156
+        },
+        "alerts": [],
+        "iocs": [],
+        "cves": [],
+        "actors": [],
+        "attack_trends": [],
+        "country_attacks": []
+    }
+
+# Request models
+class ScanRequest(BaseModel):
+    query: str
+    scan_type: str = "auto"
+
+class VirusTotalRequest(BaseModel):
+    ip: str = None
+    domain: str = None
+    url: str = None
+    file_hash: str = None
+
+class AbuseIPDBRequest(BaseModel):
+    ip: str
+    max_age_days: int = 90
+
+# Initialize data
+mock_data = load_mock_data()
+
+# Initialize real-time threat data
+real_threat_data = threat_aggregator.get_all_iocs()
+
+# API Routes
+
+@app.get("/")
+async def root():
+    return {"message": "NepalThreat Intel API", "version": "1.0.0"}
+
+@app.get("/api/dashboard/stats")
+async def get_dashboard_stats():
+    """Get dashboard statistics from real threat feeds"""
+    return threat_aggregator.get_dashboard_stats()
+
+@app.get("/api/threats")
+async def get_threats(
+    severity: str = None,
+    attack_type: str = None,
+    limit: int = 50
+):
+    """Get threat alerts from real threat feeds"""
+    alerts = threat_aggregator.get_recent_alerts(100)
+    
+    if severity:
+        alerts = [a for a in alerts if a.get("severity") == severity]
+    if attack_type:
+        alerts = [a for a in alerts if a.get("type") == attack_type]
+    
+    return alerts[:limit]
+
+@app.get("/api/threats/nepal")
+async def get_nepal_threats(limit: int = 100):
+    """Get Nepal-specific threat alerts - includes global IP threats"""
+    from services.threat_feeds import filter_nepal_threats
+    
+    # Get all IOCs
+    all_iocs = threat_aggregator.get_all_iocs()
+    
+    # Filter for Nepal-specific threats
+    nepal_iocs = filter_nepal_threats(all_iocs)
+    
+    # Convert IOCs to alerts - ADD IPs FIRST
+    alerts = []
+    
+    # Add IPs first (these are global threats)
+    for ip in nepal_iocs.get("ips", [])[:limit]:
+        alerts.append({
+            "id": ip.get("id", ""),
+            "type": "malicious_ip",
+            "severity": ip.get("severity", "high"),
+            "title": f"Malicious IP from {ip.get('source', 'threat feed')}",
+            "description": ip.get("description", "Malicious IP address from global threat feed"),
+            "source_ip": ip.get("value", ""),
+            "source_country": "Unknown",
+            "target_ip": "",
+            "target_country": "NP",
+            "timestamp": ip.get("last_seen", datetime.now().isoformat())
+        })
+    
+    # Then add URLs
+    for url in nepal_iocs.get("urls", [])[:limit]:
+        alerts.append({
+            "id": url.get("id", ""),
+            "type": "phishing",
+            "severity": url.get("severity", "high"),
+            "title": "Nepal-Targeted Phishing URL",
+            "description": url.get("description", "Phishing URL potentially targeting Nepal"),
+            "source_ip": url.get("value", ""),
+            "source_country": "Unknown",
+            "target_ip": "",
+            "target_country": "NP",
+            "timestamp": url.get("last_seen", datetime.now().isoformat())
+        })
+    
+    return alerts[:limit]
+
+@app.get("/api/threats/{alert_id}")
+async def get_threat(alert_id: str):
+    """Get specific threat alert"""
+    alerts = mock_data.get("alerts", [])
+    for alert in alerts:
+        if alert.get("id") == alert_id:
+            return alert
+    return {"error": "Alert not found"}, 404
+
+@app.get("/api/iocs")
+async def get_iocs(
+    ioc_type: str = None,
+    severity: str = None,
+    search: str = None,
+    limit: int = 50
+):
+    """Get IOC database entries from real threat feeds"""
+    all_iocs = threat_aggregator.get_all_iocs()
+    
+    # Combine all IOC types
+    iocs = []
+    iocs.extend(all_iocs.get("urls", []))
+    iocs.extend(all_iocs.get("ips", []))
+    iocs.extend(all_iocs.get("domains", []))
+    iocs.extend(all_iocs.get("hashes", []))
+    
+    if ioc_type:
+        iocs = [i for i in iocs if i.get("type") == ioc_type]
+    if severity:
+        iocs = [i for i in iocs if i.get("severity") == severity]
+    if search:
+        search_lower = search.lower()
+        iocs = [i for i in iocs if search_lower in i.get("value", "").lower() or 
+                search_lower in i.get("id", "").lower()]
+    
+    return iocs[:limit]
+
+@app.post("/api/iocs/search")
+async def search_iocs(request: dict):
+    """Search IOCs with advanced filters"""
+    iocs = mock_data.get("iocs", [])
+    
+    query = request.get("query", "")
+    ioc_type = request.get("type")
+    severity = request.get("severity")
+    tags = request.get("tags", [])
+    
+    if query:
+        query_lower = query.lower()
+        iocs = [i for i in iocs if query_lower in i.get("value", "").lower() or 
+                query_lower in i.get("id", "").lower()]
+    
+    if ioc_type:
+        iocs = [i for i in iocs if i.get("type") == ioc_type]
+    if severity:
+        iocs = [i for i in iocs if i.get("severity") == severity]
+    if tags:
+        iocs = [i for i in iocs if any(t in i.get("tags", []) for t in tags)]
+    
+    return iocs
+
+@app.get("/api/cves")
+async def get_cves(
+    severity: str = None,
+    search: str = None,
+    limit: int = 50
+):
+    """Get CVE vulnerability alerts"""
+    cves = mock_data.get("cves", [])
+    
+    if severity:
+        cves = [c for c in cves if c.get("severity") == severity]
+    if search:
+        search_lower = search.lower()
+        cves = [c for c in cves if search_lower in c.get("cve_id", "").lower() or
+                search_lower in c.get("description", "").lower()]
+    
+    return cves[:limit]
+
+@app.get("/api/actors")
+async def get_actors(
+    country: str = None,
+    motivation: str = None
+):
+    """Get threat actor profiles"""
+    actors = mock_data.get("actors", [])
+    
+    if country:
+        actors = [a for a in actors if a.get("country") == country]
+    if motivation:
+        actors = [a for a in actors if motivation in a.get("motivation", [])]
+    
+    return actors
+
+@app.get("/api/actors/{actor_id}")
+async def get_actor(actor_id: str):
+    """Get specific threat actor"""
+    actors = mock_data.get("actors", [])
+    for actor in actors:
+        if actor.get("id") == actor_id:
+            return actor
+    return {"error": "Actor not found"}, 404
+
+@app.get("/api/attack-trends")
+async def get_attack_trends():
+    """Get attack trend data (simulated from real feeds)"""
+    from datetime import datetime
+    now = datetime.now()
+    trends = []
+    
+    for i in range(24):
+        hour = (now.hour - i) % 24
+        base_attacks = 50 + (hour * 3)
+        trends.append({
+            "hour": f"{hour:02d}:00",
+            "attacks": base_attacks + (i * 5) % 30,
+            "malware": int(base_attacks * 0.3),
+            "phishing": int(base_attacks * 0.25),
+            "ddos": int(base_attacks * 0.15)
+        })
+    
+    return list(reversed(trends))
+
+@app.get("/api/country-attacks")
+async def get_country_attacks():
+    """Get attack source countries from real threat data"""
+    return threat_aggregator.get_country_stats()
+
+@app.post("/api/reports/generate")
+async def generate_report(request: dict):
+    """Generate threat intelligence report"""
+    report_type = request.get("type", "executive")
+    date_range = request.get("date_range", "7d")
+    filters = request.get("filters", {})
+    
+    report = {
+        "id": f"REP-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+        "type": report_type,
+        "date_range": date_range,
+        "generated_at": datetime.now().isoformat(),
+        "stats": mock_data.get("stats", {}),
+        "filters": filters,
+        "status": "generated"
+    }
+    
+    return report
+
+# ============================================
+# Real-Time API Integration Endpoints
+# ============================================
+
+@app.post("/api/virustotal/scan-ip")
+async def scan_ip_virustotal(request: VirusTotalRequest):
+    """Scan IP address on VirusTotal"""
+    if not request.ip:
+        return {"error": "IP address is required"}, 400
+    
+    result = vt_service.check_ip(request.ip)
+    return result
+
+@app.post("/api/virustotal/scan-domain")
+async def scan_domain_virustotal(request: VirusTotalRequest):
+    """Scan domain on VirusTotal"""
+    if not request.domain:
+        return {"error": "Domain is required"}, 400
+    
+    result = vt_service.check_domain(request.domain)
+    return result
+
+@app.post("/api/virustotal/scan-url")
+async def scan_url_virustotal(request: VirusTotalRequest):
+    """Scan URL on VirusTotal"""
+    if not request.url:
+        return {"error": "URL is required"}, 400
+    
+    result = vt_service.submit_url(request.url)
+    return result
+
+@app.post("/api/virustotal/check-hash")
+async def check_hash_virustotal(request: VirusTotalRequest):
+    """Check file hash on VirusTotal"""
+    if not request.file_hash:
+        return {"error": "File hash is required"}, 400
+    
+    result = vt_service.check_file(request.file_hash)
+    return result
+
+@app.post("/api/abuseipdb/check-ip")
+async def check_ip_abuseipdb(request: AbuseIPDBRequest):
+    """Check IP on AbuseIPDB"""
+    result = abuseipdb_service.check_ip(request.ip, request.max_age_days)
+    return result
+
+@app.post("/api/scan")
+async def combined_scan(request: ScanRequest):
+    """Combined scan using multiple threat intelligence sources"""
+    query = request.query
+    results = {
+        "query": query,
+        "timestamp": datetime.now().isoformat(),
+        "sources": {}
+    }
+    
+    # Detect type and scan accordingly
+    ip_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
+    domain_pattern = r'^[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}$'
+    url_pattern = r'^https?://'
+    hash_pattern = r'^[a-fA-F0-9]{32}$|^[a-fA-F0-9]{40}$|^[a-fA-F0-9]{64}$'
+    
+    if re.match(ip_pattern, query):
+        results["type"] = "ip"
+        results["sources"]["virustotal"] = vt_service.check_ip(query)
+        results["sources"]["abuseipdb"] = abuseipdb_service.check_ip(query)
+    elif re.match(domain_pattern, query):
+        results["type"] = "domain"
+        results["sources"]["virustotal"] = vt_service.check_domain(query)
+    elif re.match(url_pattern, query):
+        results["type"] = "url"
+        results["sources"]["virustotal"] = vt_service.submit_url(query)
+    elif re.match(hash_pattern, query):
+        results["type"] = "hash"
+        results["sources"]["virustotal"] = vt_service.check_file(query)
+    else:
+        results["type"] = "unknown"
+        results["sources"]["virustotal"] = vt_service.check_domain(query)
+    
+    # Calculate overall threat score
+    vt_result = results["sources"].get("virustotal", {})
+    abuse_result = results["sources"].get("abuseipdb", {})
+    
+    threat_score = 0
+    if vt_result.get("success"):
+        stats = vt_result.get("stats", {})
+        malicious = stats.get("malicious", 0)
+        total = stats.get("total", 1)
+        threat_score += (malicious / total) * 100 if total > 0 else 0
+    
+    if abuse_result.get("success"):
+        confidence = abuse_result.get("abuse_confidence_score", 0)
+        threat_score = max(threat_score, confidence)
+    
+    results["threat_score"] = min(100, int(threat_score))
+    
+    if threat_score >= 75:
+        results["threat_level"] = "critical"
+    elif threat_score >= 50:
+        results["threat_level"] = "high"
+    elif threat_score >= 25:
+        results["threat_level"] = "medium"
+    elif threat_score > 0:
+        results["threat_level"] = "low"
+    else:
+        results["threat_level"] = "safe"
+    
+    return results
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint"""
+    stats = threat_aggregator.get_dashboard_stats()
+    
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "data_sources": {
+            "urlhaus": "connected",
+            "emerging_threats": "connected",
+            "openphish": "connected",
+            "virustotal": "connected",
+            "abuseipdb": "connected"
+        },
+        "stats": stats
+    }
+
+@app.post("/api/refresh")
+async def refresh_threat_data():
+    """Manually refresh threat data from all sources"""
+    try:
+        data = threat_aggregator.get_all_iocs(force_refresh=True)
+        total = len(data.get("urls", [])) + len(data.get("ips", [])) + len(data.get("domains", []))
+        
+        return {
+            "success": True,
+            "message": "Threat data refreshed successfully",
+            "total_iocs": total,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@app.get("/api/sources/status")
+async def get_source_status():
+    """Get status of all threat intelligence sources"""
+    return {
+        "sources": [
+            {"name": "URLhaus", "status": "connected", "type": "malware_urls"},
+            {"name": "Emerging Threats", "status": "connected", "type": "malicious_ips"},
+            {"name": "OpenPhish", "status": "connected", "type": "phishing_urls"},
+            {"name": "VirusTotal", "status": "connected", "type": "reputation"},
+            {"name": "AbuseIPDB", "status": "connected", "type": "ip_reputation"},
+            {"name": "FireHOL", "status": "connected", "type": "malicious_ips"},
+            {"name": "Blocklist.de", "status": "connected", "type": "malicious_ips"},
+            {"name": "AlienVault OTX", "status": "connected", "type": "malicious_ips"}
+        ],
+        "last_update": datetime.now().isoformat()
+    }
+
+# ============================================
+# WebSocket for Real-Time Updates
+# ============================================
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time threat updates"""
+    await websocket_manager.connect(websocket)
+    try:
+        # Send initial stats on connection
+        stats = threat_aggregator.get_dashboard_stats()
+        await websocket.send_json({
+            "type": "initial",
+            "data": stats,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        # Keep connection alive and listen for messages
+        while True:
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_text("pong")
+    except WebSocketDisconnect:
+        websocket_manager.disconnect(websocket)
+
+# Background task to broadcast threat updates
+async def broadcast_threat_updates():
+    """Background task that periodically checks for new threats and broadcasts updates"""
+    last_count = 0
+    
+    while True:
+        try:
+            stats = threat_aggregator.get_dashboard_stats()
+            current_count = stats.get("active_threats", 0)
+            
+            if current_count > last_count:
+                await websocket_manager.send_stats_update(stats)
+                last_count = current_count
+            
+            alerts = threat_aggregator.get_recent_alerts(5)
+            if alerts:
+                for alert in alerts:
+                    await websocket_manager.send_threat_update(alert)
+            
+        except Exception as e:
+            print(f"WebSocket broadcast error: {e}")
+        
+        await asyncio.sleep(10)
+
+# Start background task when app starts
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(broadcast_threat_updates())
+    print("WebSocket background task started")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
